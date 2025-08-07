@@ -1,177 +1,188 @@
-"""
-RAG Evaluation Script
-
-This script evaluates the performance of a Retrieval-Augmented Generation (RAG) system
-using a local LLM with LM Studio.
-"""
-
-import json
-import os
-import sys
-from typing import List, Dict, Any
+from typing import Dict, Any, List
 import re
-
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain.output_parsers import OutputFixingParser, PydanticOutputParser
+import json
+import logging
+from langchain.prompts import PromptTemplate
+from langchain.schema import StrOutputParser
+from langchain.chat_models import ChatOpenAI
+from langchain.vectorstores.base import VectorStore
+from langchain.schema import Document
 from pydantic import BaseModel, Field
 
-# Add parent directory to path
-current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(current_dir)
-sys.path.append(parent_dir)
-
-# Initialize LLM (LM Studio)
-llm = ChatOpenAI(
-    openai_api_base="http://localhost:1234/v1",
-    openai_api_key="lm-studio",
-    model_name="google/gemma-3-12b",
-    temperature=0.3,
-    max_tokens=1000
-)
+# Configuración de logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class EvaluationScores(BaseModel):
+    """Modelo Pydantic para validar las puntuaciones de evaluación."""
     relevance: int = Field(..., ge=1, le=5, description="Relevance score from 1 to 5")
     completeness: int = Field(..., ge=1, le=5, description="Completeness score from 1 to 5")
-    accuracy: int = Field(..., ge=1, le=5, description="Accuracy score from 1 to 5")
+    conciseness: int = Field(..., ge=1, le=5, description="Conciseness score from 1 to 5")
 
-def evaluate_rag(retriever, num_questions: int = 5) -> Dict[str, Any]:
+def parse_evaluation(text: str) -> Dict[str, int]:
+    """Parsea la respuesta de evaluación a un diccionario de puntuaciones."""
+    try:
+        # Buscar JSON en la respuesta
+        json_match = re.search(r'\{[\s\S]*\}', text)
+        if json_match:
+            data = json.loads(json_match.group(0))
+            return {
+                "relevance": int(data.get("relevance", 1)),
+                "completeness": int(data.get("completeness", 1)),
+                "conciseness": int(data.get("conciseness", 1))
+            }
+    except Exception as e:
+        logger.warning(f"Error al parsear evaluación: {str(e)}")
+    
+    # Valores por defecto en caso de error
+    return {"relevance": 1, "completeness": 1, "conciseness": 1}
+
+def extract_questions_from_text(text: str) -> List[str]:
     """
-    Evaluates a RAG system using test questions and metrics.
+    Extrae preguntas numeradas de un texto.
     
     Args:
-        retriever: The retriever component to evaluate
-        num_questions: Number of test questions to generate
-    
+        text: Texto que contiene preguntas numeradas
+        
     Returns:
-        Dict containing evaluation metrics
+        Lista de preguntas extraídas
     """
-    # Create evaluation chain with JSON output
-    output_parser = PydanticOutputParser(pydantic_object=EvaluationScores)
+    questions = []
+    # Buscar líneas que empiecen con número seguido de punto y espacio
+    pattern = r'^\d+\.\s*(.+?)(?=\n\d+\.|\Z)'
+    matches = re.finditer(pattern, text, re.MULTILINE | re.DOTALL)
     
-    # Create a more strict evaluation prompt
+    for match in matches:
+        question = match.group(1).strip()
+        # Limpiar cualquier carácter de nueva línea dentro de la pregunta
+        question = ' '.join(question.split())
+        questions.append(question)
+    
+    return questions
+
+def evaluate_rag(retriever: VectorStore, num_questions: int = 5, text_with_questions: str = None) -> Dict[str, Any]:
+    """
+    Evalúa un sistema RAG usando preguntas extraídas de un texto.
+    
+    Args:
+        retriever: Componente de recuperación a evaluar
+        num_questions: Número máximo de preguntas a evaluar
+        text_with_questions: Texto que contiene las preguntas numeradas
+        
+    Returns:
+        Diccionario con métricas de evaluación
+    """
+    # Inicializar el modelo de lenguaje
+    llm = ChatOpenAI(
+        openai_api_base="http://localhost:1234/v1",
+        openai_api_key="lm-studio",
+        model_name="deepseek/deepseek-r1-0528-qwen3-8b",
+        temperature=0.3,
+        max_tokens=1000
+    )
+    
+    # Extraer preguntas del texto
+    questions = extract_questions_from_text(text_with_questions)
+    questions = questions[:num_questions]  # Limitar al número solicitado
+    
+    if not questions:
+        raise ValueError("No se encontraron preguntas en el texto proporcionado")
+    
+    logger.info(f"Preguntas extraídas: {questions}")
+    
+    # Prompt para evaluación
     eval_prompt = PromptTemplate(
         template="""
         Evalúa los siguientes resultados de recuperación para la pregunta.
+        
         Pregunta: {question}
         Contexto Recuperado: {context}
         
         Califica en una escala del 1-5 (5 siendo el mejor) para:
         1. Relevancia: ¿Qué tan relevante es la información recuperada para la pregunta?
         2. Completitud: ¿El contexto contiene toda la información necesaria?
-        3. Precisión: ¿La información recuperada es precisa y correcta?
+        3. Concisión: ¿La información recuperada es concisa y sin información irrelevante?
         
-        Responde ÚNICAMENTE con un objeto JSON válido que contenga EXACTAMENTE las siguientes claves: 
-        - "relevance" (número entero del 1 al 5)
-        - "completeness" (número entero del 1 al 5)
-        - "accuracy" (número entero del 1 al 5)
-        
-        No incluyas ningún otro texto, explicación o formato adicional.
+        Proporciona las calificaciones en formato JSON con estas claves exactas:
+        {{
+            "relevance": <puntuación 1-5>,
+            "completeness": <puntuación 1-5>,
+            "conciseness": <puntuación 1-5>
+        }}
         """,
         input_variables=["question", "context"]
     )
     
-    # Create the evaluation chain with output fixing
-    eval_chain = eval_prompt | llm | output_parser
-    
-    # Generate test questions
-    question_gen_prompt = PromptTemplate.from_template(
-        "Genera {num_questions} preguntas diversas sobre el tema del documento:"
-    )
-    question_chain = question_gen_prompt | llm | StrOutputParser()
+    eval_chain = eval_prompt | llm | StrOutputParser()
     
     try:
-        # Generate questions
-        questions_text = question_chain.invoke({"num_questions": num_questions})
-        questions = [q.strip() for q in questions_text.split("\n") if q.strip()]
-        
-        # Evaluate each question
+        # Evaluar cada pregunta
         results = []
-        for question in questions:
+        for question in questions:  
             try:
-                # Get retrieval results
+                # Obtener contexto usando el método correcto del retriever
                 context_docs = retriever.get_relevant_documents(question)
                 context_text = "\n\n".join([doc.page_content for doc in context_docs])
                 
-                # Get evaluation with retry
-                max_retries = 3
-                for attempt in range(max_retries):
-                    try:
-                        # Get evaluation
-                        eval_data = eval_chain.invoke({
-                            "question": question,
-                            "context": context_text
-                        })
-                        
-                        # Convert Pydantic model to dict
-                        eval_data = eval_data.dict()
-                        
-                        results.append({
-                            "question": question,
-                            "context": context_text,
-                            "evaluation": eval_data
-                        })
-                        break  # Success, exit retry loop
-                        
-                    except Exception as e:
-                        if attempt == max_retries - 1:  # Last attempt
-                            print(f"Error en la evaluación (intento {attempt + 1}/{max_retries}) para: {question[:100]}...")
-                            print(f"Error: {str(e)}")
-                            continue
+                # Evaluar
+                eval_text = eval_chain.invoke({
+                    "question": question,
+                    "context": context_text
+                })
+                
+                # Parsear evaluación
+                evaluation = parse_evaluation(eval_text)
+                
+                results.append({
+                    "question": question,
+                    "context": context_text,
+                    "evaluation": evaluation
+                })
+                
+                logger.debug(f"Pregunta evaluada: {question[:50]}...")
                 
             except Exception as e:
-                print(f"Error procesando pregunta '{question}': {str(e)}")
-                continue
+                logger.error(f"Error al evaluar pregunta: {str(e)}")
+                results.append({
+                    "question": question,
+                    "error": str(e),
+                    "evaluation": {"relevance": 1, "completeness": 1, "conciseness": 1}
+                })
         
-        # Calculate average scores
-        avg_scores = calculate_average_scores(results)
+        # Calcular promedios
+        if results:
+            avg_scores = {
+                "average_relevance": round(sum(r["evaluation"].get("relevance", 1) for r in results) / len(results), 2),
+                "average_completeness": round(sum(r["evaluation"].get("completeness", 1) for r in results) / len(results), 2),
+                "average_conciseness": round(sum(r["evaluation"].get("conciseness", 1) for r in results) / len(results), 2)
+            }
+        else:
+            avg_scores = {
+                "average_relevance": 0,
+                "average_completeness": 0,
+                "average_conciseness": 0
+            }
         
         return {
-            "questions": [r["question"] for r in results],
+            "questions": questions,
             "results": results,
             "average_scores": avg_scores
         }
         
     except Exception as e:
+        logger.error(f"Error en la evaluación RAG: {str(e)}")
         return {
             "error": str(e),
-            "details": "Error durante la evaluación del RAG"
+            "questions": [],
+            "results": [],
+            "average_scores": {
+                "average_relevance": 0,
+                "average_completeness": 0,
+                "average_conciseness": 0
+            }
         }
 
-def calculate_average_scores(results: List[Dict]) -> Dict[str, float]:
-    """
-    Calculate average scores across all evaluation results.
-    """
-    if not results:
-        return {}
-    
-    total_scores = {
-        "relevance": 0,
-        "completeness": 0,
-        "accuracy": 0,
-        "count": 0
-    }
-    
-    for result in results:
-        eval_data = result.get("evaluation", {})
-        if not isinstance(eval_data, dict):
-            continue
-            
-        total_scores["relevance"] += float(eval_data.get("relevance", 0))
-        total_scores["completeness"] += float(eval_data.get("completeness", 0))
-        total_scores["accuracy"] += float(eval_data.get("accuracy", 0))
-        total_scores["count"] += 1
-    
-    if total_scores["count"] == 0:
-        return {}
-    
-    return {
-        "average_relevance": total_scores["relevance"] / total_scores["count"],
-        "average_completeness": total_scores["completeness"] / total_scores["count"],
-        "average_accuracy": total_scores["accuracy"] / total_scores["count"]
-    }
-
+# Función auxiliar para pruebas
 if __name__ == "__main__":
-    print("Módulo de evaluación RAG para LM Studio")
-    print("Importa este módulo y usa la función evaluate_rag() con tu retriever.")
+    
+    pass
